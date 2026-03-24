@@ -1,0 +1,358 @@
+import os
+import random
+import asyncio
+from datetime import datetime, timedelta, timezone
+
+import aiosqlite
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+TOKEN = os.getenv("TOKEN")
+DB_PATH = "economia.db"
+
+DAILY_REWARD = 30
+ENTRADA_REWARD = 1000
+
+RELIC_REWARDS = {
+    "comum": (40, 80),
+    "rara": (100, 180),
+    "lendaria": (250, 400),
+    "vazia": (0, 0),
+}
+
+RELIC_CHANCES = [
+    ("comum", 55),
+    ("rara", 25),
+    ("lendaria", 10),
+    ("vazia", 10),
+]
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class StarkBot(commands.Bot):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.members = True
+
+        super().__init__(command_prefix="!", intents=intents)
+        self.db: aiosqlite.Connection | None = None
+
+    async def setup_hook(self):
+        self.db = await aiosqlite.connect(DB_PATH)
+        await self.db.execute("PRAGMA journal_mode=WAL;")
+        await self.create_tables()
+        await self.tree.sync()
+
+    async def create_tables(self):
+        await self.db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                balance INTEGER NOT NULL DEFAULT 0,
+                last_daily TEXT,
+                last_relic TEXT
+            )
+            """
+        )
+
+        await self.db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                tipo TEXT NOT NULL,
+                valor INTEGER NOT NULL,
+                descricao TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        await self.db.commit()
+
+    async def close(self):
+        if self.db:
+            await self.db.close()
+        await super().close()
+
+
+bot = StarkBot()
+
+
+async def ensure_user(user_id: int):
+    async with bot.db.execute(
+        "SELECT user_id FROM users WHERE user_id = ?",
+        (user_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+
+    if row is None:
+        await bot.db.execute(
+            "INSERT INTO users (user_id, balance) VALUES (?, ?)",
+            (user_id, 0),
+        )
+        await bot.db.commit()
+
+
+async def get_balance(user_id: int) -> int:
+    await ensure_user(user_id)
+
+    async with bot.db.execute(
+        "SELECT balance FROM users WHERE user_id = ?",
+        (user_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+
+    return row[0] if row else 0
+
+
+async def add_balance(user_id: int, amount: int, tipo: str, descricao: str = ""):
+    await ensure_user(user_id)
+
+    await bot.db.execute(
+        "UPDATE users SET balance = balance + ? WHERE user_id = ?",
+        (amount, user_id),
+    )
+    await bot.db.execute(
+        """
+        INSERT INTO transactions (user_id, tipo, valor, descricao, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (user_id, tipo, amount, descricao, utc_now().isoformat()),
+    )
+    await bot.db.commit()
+
+
+async def set_last_daily(user_id: int, when_iso: str):
+    await bot.db.execute(
+        "UPDATE users SET last_daily = ? WHERE user_id = ?",
+        (when_iso, user_id),
+    )
+    await bot.db.commit()
+
+
+async def get_last_daily(user_id: int):
+    await ensure_user(user_id)
+
+    async with bot.db.execute(
+        "SELECT last_daily FROM users WHERE user_id = ?",
+        (user_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+
+    return row[0] if row else None
+
+
+async def set_last_relic(user_id: int, when_iso: str):
+    await bot.db.execute(
+        "UPDATE users SET last_relic = ? WHERE user_id = ?",
+        (when_iso, user_id),
+    )
+    await bot.db.commit()
+
+
+async def get_last_relic(user_id: int):
+    await ensure_user(user_id)
+
+    async with bot.db.execute(
+        "SELECT last_relic FROM users WHERE user_id = ?",
+        (user_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+
+    return row[0] if row else None
+
+
+def time_remaining_text(last_iso: str) -> str:
+    then = datetime.fromisoformat(last_iso)
+    next_time = then + timedelta(days=1)
+    remaining = next_time - utc_now()
+
+    if remaining.total_seconds() < 0:
+        return "0h 0m"
+
+    total_seconds = int(remaining.total_seconds())
+    hours, rest = divmod(total_seconds, 3600)
+    minutes, _ = divmod(rest, 60)
+    return f"{hours}h {minutes}m"
+
+
+def roll_relic() -> tuple[str, int]:
+    names = [name for name, _ in RELIC_CHANCES]
+    weights = [weight for _, weight in RELIC_CHANCES]
+    rarity = random.choices(names, weights=weights, k=1)[0]
+
+    min_reward, max_reward = RELIC_REWARDS[rarity]
+    reward = random.randint(min_reward, max_reward) if max_reward > 0 else 0
+    return rarity, reward
+
+
+@bot.event
+async def on_ready():
+    print(f"Stark online como {bot.user}")
+
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    if member.bot:
+        return
+
+    await ensure_user(member.id)
+    current_balance = await get_balance(member.id)
+
+    if current_balance == 0:
+        await add_balance(
+            member.id,
+            ENTRADA_REWARD,
+            "entrada",
+            "Bônus de entrada no servidor",
+        )
+
+
+@bot.tree.command(name="saldo", description="Mostra seu saldo de Solários.")
+async def saldo(interaction: discord.Interaction):
+    balance = await get_balance(interaction.user.id)
+
+    embed = discord.Embed(
+        title="Saldo",
+        description=f"Você possui **{balance} ✦ Solários**.",
+        color=discord.Color.dark_teal(),
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="daily", description="Receba sua recompensa diária.")
+async def daily(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    last_daily = await get_last_daily(user_id)
+
+    if last_daily:
+        then = datetime.fromisoformat(last_daily)
+        if utc_now() < then + timedelta(days=1):
+            await interaction.response.send_message(
+                f"Seu daily já foi coletado. Tente novamente em **{time_remaining_text(last_daily)}**.",
+                ephemeral=True,
+            )
+            return
+
+    await add_balance(user_id, DAILY_REWARD, "daily", "Recompensa diária")
+    await set_last_daily(user_id, utc_now().isoformat())
+
+    balance = await get_balance(user_id)
+    embed = discord.Embed(
+        title="Daily coletado",
+        description=(
+            f"Você recebeu **{DAILY_REWARD} ✦ Solários**.\n"
+            f"Saldo atual: **{balance} ✦ Solários**."
+        ),
+        color=discord.Color.blurple(),
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="pagar", description="Envia Solários para outra pessoa.")
+@app_commands.describe(usuario="Quem vai receber", valor="Quantidade de Solários")
+async def pagar(
+    interaction: discord.Interaction,
+    usuario: discord.Member,
+    valor: app_commands.Range[int, 1, 999999],
+):
+    if usuario.bot:
+        await interaction.response.send_message(
+            "Não é possível transferir Solários para bots.",
+            ephemeral=True,
+        )
+        return
+
+    if usuario.id == interaction.user.id:
+        await interaction.response.send_message(
+            "Você não pode pagar a si mesma.",
+            ephemeral=True,
+        )
+        return
+
+    saldo_atual = await get_balance(interaction.user.id)
+    if saldo_atual < valor:
+        await interaction.response.send_message(
+            f"Saldo insuficiente. Você possui **{saldo_atual} ✦ Solários**.",
+            ephemeral=True,
+        )
+        return
+
+    await add_balance(
+        interaction.user.id,
+        -valor,
+        "pagamento_enviado",
+        f"Enviado para {usuario.id}",
+    )
+    await add_balance(
+        usuario.id,
+        valor,
+        "pagamento_recebido",
+        f"Recebido de {interaction.user.id}",
+    )
+
+    embed = discord.Embed(
+        title="Transferência concluída",
+        description=(
+            f"Você enviou **{valor} ✦ Solários** para {usuario.mention}.\n"
+            f"Seu novo saldo é **{await get_balance(interaction.user.id)} ✦ Solários**."
+        ),
+        color=discord.Color.gold(),
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="reliquia", description="Abra sua relíquia diária.")
+async def reliquia(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    last_relic = await get_last_relic(user_id)
+
+    if last_relic:
+        then = datetime.fromisoformat(last_relic)
+        if utc_now() < then + timedelta(days=1):
+            await interaction.response.send_message(
+                f"Sua relíquia de hoje já foi aberta. Volte em **{time_remaining_text(last_relic)}**.",
+                ephemeral=True,
+            )
+            return
+
+    rarity, reward = roll_relic()
+    await set_last_relic(user_id, utc_now().isoformat())
+
+    if reward > 0:
+        await add_balance(user_id, reward, "reliquia", f"Relíquia {rarity}")
+        desc = (
+            f"Classificação: **{rarity.title()}**\n"
+            f"Você recebeu **{reward} ✦ Solários**.\n"
+            f"Saldo atual: **{await get_balance(user_id)} ✦ Solários**."
+        )
+        color = discord.Color.purple() if rarity == "lendaria" else discord.Color.dark_gold()
+    else:
+        desc = (
+            f"Classificação: **Vazia**\n"
+            f"Desta vez não havia Solários dentro da relíquia."
+        )
+        color = discord.Color.dark_grey()
+
+    embed = discord.Embed(
+        title="Relíquia aberta",
+        description=desc,
+        color=color,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+async def main():
+    if not TOKEN:
+        raise RuntimeError("A variável de ambiente TOKEN não foi configurada.")
+
+    async with bot:
+        await bot.start(TOKEN)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

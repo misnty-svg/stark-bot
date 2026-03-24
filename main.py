@@ -9,17 +9,12 @@ from discord import app_commands
 from discord.ext import commands
 
 TOKEN = os.getenv("TOKEN")
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 DB_PATH = "/app/data/economia.db"
 
+MOEDA = "✦ Solários"
 DAILY_REWARD = 30
 ENTRADA_REWARD = 1000
-
-RELIC_REWARDS = {
-    "comum": (40, 80),
-    "rara": (100, 180),
-    "lendaria": (250, 400),
-    "vazia": (0, 0),
-}
 
 RELIC_CHANCES = [
     ("comum", 55),
@@ -28,16 +23,55 @@ RELIC_CHANCES = [
     ("vazia", 10),
 ]
 
+RELIC_REWARDS = {
+    "comum": (40, 80),
+    "rara": (100, 180),
+    "lendaria": (250, 400),
+    "vazia": (0, 0),
+}
+
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    return datetime.fromisoformat(value)
+
+
+def remaining_text(last_iso: str) -> str:
+    then = parse_iso(last_iso)
+    if then is None:
+        return "0h 0m"
+
+    next_time = then + timedelta(days=1)
+    remaining = next_time - utc_now()
+
+    if remaining.total_seconds() <= 0:
+        return "0h 0m"
+
+    total_seconds = int(remaining.total_seconds())
+    hours, rest = divmod(total_seconds, 3600)
+    minutes, _ = divmod(rest, 60)
+    return f"{hours}h {minutes}m"
+
+
+def roll_relic() -> tuple[str, int]:
+    names = [name for name, _ in RELIC_CHANCES]
+    weights = [weight for _, weight in RELIC_CHANCES]
+    rarity = random.choices(names, weights=weights, k=1)[0]
+
+    min_reward, max_reward = RELIC_REWARDS[rarity]
+    reward = random.randint(min_reward, max_reward) if max_reward > 0 else 0
+    return rarity, reward
 
 
 class StarkBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.members = True
-
         super().__init__(command_prefix="!", intents=intents)
         self.db: aiosqlite.Connection | None = None
 
@@ -82,6 +116,10 @@ class StarkBot(commands.Bot):
 bot = StarkBot()
 
 
+def is_owner(user_id: int) -> bool:
+    return OWNER_ID != 0 and user_id == OWNER_ID
+
+
 async def ensure_user(user_id: int):
     async with bot.db.execute(
         "SELECT user_id FROM users WHERE user_id = ?",
@@ -91,8 +129,8 @@ async def ensure_user(user_id: int):
 
     if row is None:
         await bot.db.execute(
-            "INSERT INTO users (user_id, balance) VALUES (?, ?)",
-            (user_id, 0),
+            "INSERT INTO users (user_id, balance, last_daily, last_relic) VALUES (?, 0, NULL, NULL)",
+            (user_id,),
         )
         await bot.db.commit()
 
@@ -126,14 +164,6 @@ async def add_balance(user_id: int, amount: int, tipo: str, descricao: str = "")
     await bot.db.commit()
 
 
-async def set_last_daily(user_id: int, when_iso: str):
-    await bot.db.execute(
-        "UPDATE users SET last_daily = ? WHERE user_id = ?",
-        (when_iso, user_id),
-    )
-    await bot.db.commit()
-
-
 async def get_last_daily(user_id: int):
     await ensure_user(user_id)
 
@@ -146,9 +176,9 @@ async def get_last_daily(user_id: int):
     return row[0] if row else None
 
 
-async def set_last_relic(user_id: int, when_iso: str):
+async def set_last_daily(user_id: int, when_iso: str):
     await bot.db.execute(
-        "UPDATE users SET last_relic = ? WHERE user_id = ?",
+        "UPDATE users SET last_daily = ? WHERE user_id = ?",
         (when_iso, user_id),
     )
     await bot.db.commit()
@@ -166,28 +196,12 @@ async def get_last_relic(user_id: int):
     return row[0] if row else None
 
 
-def time_remaining_text(last_iso: str) -> str:
-    then = datetime.fromisoformat(last_iso)
-    next_time = then + timedelta(days=1)
-    remaining = next_time - utc_now()
-
-    if remaining.total_seconds() < 0:
-        return "0h 0m"
-
-    total_seconds = int(remaining.total_seconds())
-    hours, rest = divmod(total_seconds, 3600)
-    minutes, _ = divmod(rest, 60)
-    return f"{hours}h {minutes}m"
-
-
-def roll_relic() -> tuple[str, int]:
-    names = [name for name, _ in RELIC_CHANCES]
-    weights = [weight for _, weight in RELIC_CHANCES]
-    rarity = random.choices(names, weights=weights, k=1)[0]
-
-    min_reward, max_reward = RELIC_REWARDS[rarity]
-    reward = random.randint(min_reward, max_reward) if max_reward > 0 else 0
-    return rarity, reward
+async def set_last_relic(user_id: int, when_iso: str):
+    await bot.db.execute(
+        "UPDATE users SET last_relic = ? WHERE user_id = ?",
+        (when_iso, user_id),
+    )
+    await bot.db.commit()
 
 
 @bot.event
@@ -201,9 +215,9 @@ async def on_member_join(member: discord.Member):
         return
 
     await ensure_user(member.id)
-    current_balance = await get_balance(member.id)
+    balance = await get_balance(member.id)
 
-    if current_balance == 0:
+    if balance == 0:
         await add_balance(
             member.id,
             ENTRADA_REWARD,
@@ -212,13 +226,13 @@ async def on_member_join(member: discord.Member):
         )
 
 
-@bot.tree.command(name="saldo", description="Mostra seu saldo de Solários.")
+@bot.tree.command(name="saldo", description="Mostra seu saldo atual.")
 async def saldo(interaction: discord.Interaction):
     balance = await get_balance(interaction.user.id)
 
     embed = discord.Embed(
         title="Saldo",
-        description=f"Você possui **{balance} ✦ Solários**.",
+        description=f"Você possui **{balance} {MOEDA}**.",
         color=discord.Color.dark_teal(),
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -230,10 +244,10 @@ async def daily(interaction: discord.Interaction):
     last_daily = await get_last_daily(user_id)
 
     if last_daily:
-        then = datetime.fromisoformat(last_daily)
-        if utc_now() < then + timedelta(days=1):
+        then = parse_iso(last_daily)
+        if then and utc_now() < then + timedelta(days=1):
             await interaction.response.send_message(
-                f"Seu daily já foi coletado. Tente novamente em **{time_remaining_text(last_daily)}**.",
+                f"Seu daily já foi coletado. Tente novamente em **{remaining_text(last_daily)}**.",
                 ephemeral=True,
             )
             return
@@ -245,8 +259,8 @@ async def daily(interaction: discord.Interaction):
     embed = discord.Embed(
         title="Daily coletado",
         description=(
-            f"Você recebeu **{DAILY_REWARD} ✦ Solários**.\n"
-            f"Saldo atual: **{balance} ✦ Solários**."
+            f"Você recebeu **{DAILY_REWARD} {MOEDA}**.\n"
+            f"Saldo atual: **{balance} {MOEDA}**."
         ),
         color=discord.Color.blurple(),
     )
@@ -258,7 +272,7 @@ async def daily(interaction: discord.Interaction):
 async def pagar(
     interaction: discord.Interaction,
     usuario: discord.Member,
-    valor: app_commands.Range[int, 1, 999999],
+    valor: app_commands.Range[int, 1, 999999999],
 ):
     if usuario.bot:
         await interaction.response.send_message(
@@ -277,7 +291,7 @@ async def pagar(
     saldo_atual = await get_balance(interaction.user.id)
     if saldo_atual < valor:
         await interaction.response.send_message(
-            f"Saldo insuficiente. Você possui **{saldo_atual} ✦ Solários**.",
+            f"Saldo insuficiente. Você possui **{saldo_atual} {MOEDA}**.",
             ephemeral=True,
         )
         return
@@ -295,11 +309,12 @@ async def pagar(
         f"Recebido de {interaction.user.id}",
     )
 
+    novo_saldo = await get_balance(interaction.user.id)
     embed = discord.Embed(
         title="Transferência concluída",
         description=(
-            f"Você enviou **{valor} ✦ Solários** para {usuario.mention}.\n"
-            f"Seu novo saldo é **{await get_balance(interaction.user.id)} ✦ Solários**."
+            f"Você enviou **{valor} {MOEDA}** para {usuario.mention}.\n"
+            f"Seu novo saldo é **{novo_saldo} {MOEDA}**."
         ),
         color=discord.Color.gold(),
     )
@@ -312,10 +327,10 @@ async def reliquia(interaction: discord.Interaction):
     last_relic = await get_last_relic(user_id)
 
     if last_relic:
-        then = datetime.fromisoformat(last_relic)
-        if utc_now() < then + timedelta(days=1):
+        then = parse_iso(last_relic)
+        if then and utc_now() < then + timedelta(days=1):
             await interaction.response.send_message(
-                f"Sua relíquia de hoje já foi aberta. Volte em **{time_remaining_text(last_relic)}**.",
+                f"Sua relíquia de hoje já foi aberta. Volte em **{remaining_text(last_relic)}**.",
                 ephemeral=True,
             )
             return
@@ -325,16 +340,17 @@ async def reliquia(interaction: discord.Interaction):
 
     if reward > 0:
         await add_balance(user_id, reward, "reliquia", f"Relíquia {rarity}")
+        saldo_atual = await get_balance(user_id)
         desc = (
             f"Classificação: **{rarity.title()}**\n"
-            f"Você recebeu **{reward} ✦ Solários**.\n"
-            f"Saldo atual: **{await get_balance(user_id)} ✦ Solários**."
+            f"Você recebeu **{reward} {MOEDA}**.\n"
+            f"Saldo atual: **{saldo_atual} {MOEDA}**."
         )
         color = discord.Color.purple() if rarity == "lendaria" else discord.Color.dark_gold()
     else:
         desc = (
-            f"Classificação: **Vazia**\n"
-            f"Desta vez não havia Solários dentro da relíquia."
+            "Classificação: **Vazia**\n"
+            "Desta vez não havia Solários dentro da relíquia."
         )
         color = discord.Color.dark_grey()
 
@@ -344,6 +360,72 @@ async def reliquia(interaction: discord.Interaction):
         color=color,
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="addsolarios", description="Adiciona Solários a um usuário.")
+@app_commands.describe(usuario="Quem vai receber", valor="Quantidade")
+async def addsolarios(
+    interaction: discord.Interaction,
+    usuario: discord.Member,
+    valor: app_commands.Range[int, 1, 999999999],
+):
+    if not is_owner(interaction.user.id):
+        await interaction.response.send_message(
+            "Você não tem permissão para usar este comando.",
+            ephemeral=True,
+        )
+        return
+
+    await add_balance(
+        usuario.id,
+        valor,
+        "admin_add",
+        "Adição manual de Solários",
+    )
+    saldo_atual = await get_balance(usuario.id)
+
+    await interaction.response.send_message(
+        f"{usuario.mention} recebeu **{valor} {MOEDA}**.\nSaldo atual: **{saldo_atual} {MOEDA}**.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="removersolarios", description="Remove Solários de um usuário.")
+@app_commands.describe(usuario="Quem vai perder", valor="Quantidade")
+async def removersolarios(
+    interaction: discord.Interaction,
+    usuario: discord.Member,
+    valor: app_commands.Range[int, 1, 999999999],
+):
+    if not is_owner(interaction.user.id):
+        await interaction.response.send_message(
+            "Você não tem permissão para usar este comando.",
+            ephemeral=True,
+        )
+        return
+
+    saldo_atual = await get_balance(usuario.id)
+    valor_final = min(valor, saldo_atual)
+
+    if valor_final <= 0:
+        await interaction.response.send_message(
+            f"{usuario.mention} não possui saldo para remover.",
+            ephemeral=True,
+        )
+        return
+
+    await add_balance(
+        usuario.id,
+        -valor_final,
+        "admin_remove",
+        "Remoção manual de Solários",
+    )
+    saldo_novo = await get_balance(usuario.id)
+
+    await interaction.response.send_message(
+        f"Foram removidos **{valor_final} {MOEDA}** de {usuario.mention}.\nSaldo atual: **{saldo_novo} {MOEDA}**.",
+        ephemeral=True,
+    )
 
 
 async def main():

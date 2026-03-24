@@ -9,7 +9,7 @@ from discord import app_commands
 from discord.ext import commands
 
 TOKEN = os.getenv("TOKEN")
-DB_PATH = "economia.db"
+DB_PATH = "/app/data/economia.db"
 
 DAILY_REWARD = 30
 ENTRADA_REWARD = 1000
@@ -37,7 +37,6 @@ class StarkBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.members = True
-
         super().__init__(command_prefix="!", intents=intents)
         self.db: aiosqlite.Connection | None = None
 

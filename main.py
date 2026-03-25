@@ -13,8 +13,13 @@ OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 DB_PATH = "/app/data/economia.db"
 
 MOEDA = "✦ Solários"
+SIMBOLO_PRESENCA = "✦"
 DAILY_REWARD = 30
 ENTRADA_REWARD = 1000
+
+# Bônus automático por interação
+INTERACTION_REWARD = 10
+INTERACTION_COOLDOWN_MINUTES = 10
 
 RELIC_CHANCES = [
     ("comum", 55),
@@ -38,15 +43,18 @@ def utc_now() -> datetime:
 def parse_iso(value: str | None) -> datetime | None:
     if not value:
         return None
-    return datetime.fromisoformat(value)
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
 
 
-def remaining_text(last_iso: str) -> str:
+def remaining_text(last_iso: str, hours_to_wait: int = 24) -> str:
     then = parse_iso(last_iso)
     if then is None:
         return "0h 0m"
 
-    next_time = then + timedelta(days=1)
+    next_time = then + timedelta(hours=hours_to_wait)
     remaining = next_time - utc_now()
 
     if remaining.total_seconds() <= 0:
@@ -72,6 +80,7 @@ class StarkBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.members = True
+        intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)
         self.db: aiosqlite.Connection | None = None
 
@@ -88,7 +97,8 @@ class StarkBot(commands.Bot):
                 user_id INTEGER PRIMARY KEY,
                 balance INTEGER NOT NULL DEFAULT 0,
                 last_daily TEXT,
-                last_relic TEXT
+                last_relic TEXT,
+                last_interaction_reward TEXT
             )
             """
         )
@@ -105,6 +115,27 @@ class StarkBot(commands.Bot):
             )
             """
         )
+
+        # migração para bancos antigos
+        async with self.db.execute("PRAGMA table_info(users)") as cursor:
+            columns = await cursor.fetchall()
+
+        column_names = {col[1] for col in columns}
+        if "last_interaction_reward" not in column_names:
+            await self.db.execute(
+                "ALTER TABLE users ADD COLUMN last_interaction_reward TEXT"
+            )
+
+        if "last_daily" not in column_names:
+            await self.db.execute(
+                "ALTER TABLE users ADD COLUMN last_daily TEXT"
+            )
+
+        if "last_relic" not in column_names:
+            await self.db.execute(
+                "ALTER TABLE users ADD COLUMN last_relic TEXT"
+            )
+
         await self.db.commit()
 
     async def close(self):
@@ -129,7 +160,11 @@ async def ensure_user(user_id: int):
 
     if row is None:
         await bot.db.execute(
-            "INSERT INTO users (user_id, balance, last_daily, last_relic) VALUES (?, 0, NULL, NULL)",
+            """
+            INSERT INTO users (
+                user_id, balance, last_daily, last_relic, last_interaction_reward
+            ) VALUES (?, 0, NULL, NULL, NULL)
+            """,
             (user_id,),
         )
         await bot.db.commit()
@@ -204,6 +239,38 @@ async def set_last_relic(user_id: int, when_iso: str):
     await bot.db.commit()
 
 
+async def get_last_interaction_reward(user_id: int):
+    await ensure_user(user_id)
+
+    async with bot.db.execute(
+        "SELECT last_interaction_reward FROM users WHERE user_id = ?",
+        (user_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+
+    return row[0] if row else None
+
+
+async def set_last_interaction_reward(user_id: int, when_iso: str):
+    await bot.db.execute(
+        "UPDATE users SET last_interaction_reward = ? WHERE user_id = ?",
+        (when_iso, user_id),
+    )
+    await bot.db.commit()
+
+
+async def can_receive_interaction_reward(user_id: int) -> bool:
+    last_reward = await get_last_interaction_reward(user_id)
+    if not last_reward:
+        return True
+
+    then = parse_iso(last_reward)
+    if then is None:
+        return True
+
+    return utc_now() >= then + timedelta(minutes=INTERACTION_COOLDOWN_MINUTES)
+
+
 @bot.event
 async def on_ready():
     print(f"Stark online como {bot.user}")
@@ -224,6 +291,37 @@ async def on_member_join(member: discord.Member):
             "entrada",
             "Bônus de entrada no servidor",
         )
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+
+    if message.guild is None:
+        return
+
+    await ensure_user(message.author.id)
+
+    if await can_receive_interaction_reward(message.author.id):
+        await add_balance(
+            message.author.id,
+            INTERACTION_REWARD,
+            "interacao",
+            f"Bônus automático por presença a cada {INTERACTION_COOLDOWN_MINUTES} minutos",
+        )
+        await set_last_interaction_reward(message.author.id, utc_now().isoformat())
+
+        try:
+            await message.channel.send(
+                f"{SIMBOLO_PRESENCA} Presença reconhecida, {message.author.mention} +{INTERACTION_REWARD} {MOEDA}"
+            )
+        except discord.Forbidden:
+            pass
+        except discord.HTTPException:
+            pass
+
+    await bot.process_commands(message)
 
 
 @bot.tree.command(name="saldo", description="Mostra seu saldo atual.")
@@ -428,6 +526,94 @@ async def removersolarios(
     )
 
 
+@bot.tree.command(name="bonusgeral", description="Dá Solários para todos do servidor.")
+@app_commands.describe(valor="Quantidade que cada pessoa vai receber")
+async def bonusgeral(
+    interaction: discord.Interaction,
+    valor: app_commands.Range[int, 1, 999999999],
+):
+    if not is_owner(interaction.user.id):
+        await interaction.response.send_message(
+            "Você não tem permissão para usar este comando.",
+            ephemeral=True,
+        )
+        return
+
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "Este comando só pode ser usado dentro de um servidor.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    membros_validos = [m for m in interaction.guild.members if not m.bot]
+    total_membros = 0
+
+    for membro in membros_validos:
+        await add_balance(
+            membro.id,
+            valor,
+            "bonus_geral",
+            f"Bônus geral enviado por {interaction.user.id}",
+        )
+        total_membros += 1
+
+    total_distribuido = total_membros * valor
+    await interaction.followup.send(
+        f"Bônus geral pago com sucesso.\n"
+        f"Cada membro recebeu **{valor} {MOEDA}**.\n"
+        f"Membros bonificados: **{total_membros}**.\n"
+        f"Total distribuído: **{total_distribuido} {MOEDA}**.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="pagarbonusgeral", description="Alias de bônus geral.")
+@app_commands.describe(valor="Quantidade que cada pessoa vai receber")
+async def pagarbonusgeral(
+    interaction: discord.Interaction,
+    valor: app_commands.Range[int, 1, 999999999],
+):
+    if not is_owner(interaction.user.id):
+        await interaction.response.send_message(
+            "Você não tem permissão para usar este comando.",
+            ephemeral=True,
+        )
+        return
+
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "Este comando só pode ser usado dentro de um servidor.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    membros_validos = [m for m in interaction.guild.members if not m.bot]
+    total_membros = 0
+
+    for membro in membros_validos:
+        await add_balance(
+            membro.id,
+            valor,
+            "bonus_geral",
+            f"Bônus geral enviado por {interaction.user.id}",
+        )
+        total_membros += 1
+
+    total_distribuido = total_membros * valor
+    await interaction.followup.send(
+        f"Bônus geral pago com sucesso.\n"
+        f"Cada membro recebeu **{valor} {MOEDA}**.\n"
+        f"Membros bonificados: **{total_membros}**.\n"
+        f"Total distribuído: **{total_distribuido} {MOEDA}**.",
+        ephemeral=True,
+    )
+
+
 async def main():
     if not TOKEN:
         raise RuntimeError("A variável de ambiente TOKEN não foi configurada.")
@@ -438,3 +624,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+

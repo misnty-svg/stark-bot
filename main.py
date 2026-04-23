@@ -416,7 +416,17 @@ async def pagar(
         ),
         color=discord.Color.gold(),
     )
+
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    try:
+        await interaction.channel.send(
+            f"💰 {usuario.mention} recebeu **{valor} {MOEDA}** de {interaction.user.mention}."
+        )
+    except discord.Forbidden:
+        pass
+    except discord.HTTPException:
+        pass
 
 
 @bot.tree.command(name="reliquia", description="Abra sua relíquia diária.")
@@ -624,4 +634,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
